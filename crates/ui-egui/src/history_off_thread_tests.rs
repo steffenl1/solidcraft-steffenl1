@@ -773,6 +773,56 @@ fn delete_on_the_selection_checks_off_the_window_thread() {
     assert!((volume(&mut h) - block_with_hole()).abs() < 1.0);
 }
 
+/// A 40 × 20 rectangle with its two sides dimensioned, extruded 10 mm (or by the first
+/// dimension's parameter, `by_d1`), and the sketch open again for editing; every command
+/// computes off the window thread. Returns the dimensions' ids.
+fn editing_dimensioned_sketch(by_d1: bool) -> (Harness, String, String) {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 20]})).unwrap();
+    let d1 = h.app.run("sketch.dimension", json!({"entities": ["l1"], "value": 40})).unwrap();
+    let d2 = h.app.run("sketch.dimension", json!({"entities": ["l2"], "value": 20})).unwrap();
+    let sketch = h.app.session.active_sketch.unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    let distance = if by_d1 { d1["param"].clone() } else { json!(10) };
+    h.app.run("solid.extrude", json!({"distance": distance})).unwrap();
+    assert!(h.app.session.model.results.iter().all(|r| r.error.is_none()));
+    h.app.run("sketch.edit", json!({"sketch": sketch})).unwrap();
+    h.app.apply_off_thread = Some(Duration::ZERO);
+    let id = |r: &serde_json::Value| r["created"]["dimensions"][0].as_str().unwrap().to_string();
+    (h, id(&d1), id(&d2))
+}
+
+fn has_constraint(h: &Harness, id: &str) -> bool {
+    let sketch = h.app.session.doc.sketch(h.app.session.active_sketch.unwrap()).unwrap();
+    sketch.constraints.iter().any(|c| c.id == id)
+}
+
+/// Delete on a dimension nothing else uses goes at once: no dry run of the features after the
+/// sketch, which took minutes on a long history (#7253).
+#[test]
+fn delete_on_an_unused_sketch_dimension_skips_the_check() {
+    let (mut h, d1, d2) = editing_dimensioned_sketch(false);
+    h.app.session.selection = vec![solidcraft_engine::Sel::SketchConstraint { id: d1.clone() }];
+    crate::delete::delete_selection(&mut h.app);
+    assert!(h.app.delete_check.is_none(), "no dry run");
+    assert!(!has_constraint(&h, &d1), "deleted at once");
+    assert!(has_constraint(&h, &d2));
+    assert!(h.app.menu.confirm.is_none());
+}
+
+/// A dimension whose parameter a later feature reads is still checked first.
+#[test]
+fn delete_on_a_sketch_dimension_a_feature_uses_is_checked() {
+    let (mut h, d1, _) = editing_dimensioned_sketch(true);
+    h.app.session.selection = vec![solidcraft_engine::Sel::SketchConstraint { id: d1.clone() }];
+    crate::delete::delete_selection(&mut h.app);
+    assert!(h.app.delete_check.is_some(), "the dry run checks what the delete changes");
+    until_settled(&mut h);
+    assert!(h.app.delete_check.is_none());
+}
+
 /// A design changed while its delete is checked is checked again before anything is deleted, and
 /// a second Delete meanwhile is left out.
 #[test]

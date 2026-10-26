@@ -116,9 +116,41 @@ pub fn request(app: &mut SolveApp, params: Value) {
     if is_empty(&params) {
         return;
     }
+    // Nothing for `selection.delete` to find: it would evaluate the rolled-back history after the
+    // sketch, in its dry run and again in the delete (#7253). As a picked glyph's Delete does.
+    if let Some(entities) = unused_sketch_constraints(app, &params) {
+        match app.run("sketch.delete", json!({ "entities": entities })) {
+            Ok(_) => app.session.selection.clear(),
+            Err(e) => app.set_status(e.replace("sketch.delete: ", ""), true),
+        }
+        return;
+    }
     let mut dry = params.clone();
     dry["dry_run"] = json!(true);
     app.check_delete(vec![("selection.delete".to_string(), dry)], crate::deferred::AfterCheck::Selection(params));
+}
+
+/// The constraint ids when `params` are only constraints and dimensions of the sketch being
+/// edited whose parameters nothing else uses: deleting them deletes no feature and leaves every
+/// parameter another feature reads.
+fn unused_sketch_constraints(app: &SolveApp, params: &Value) -> Option<Vec<String>> {
+    use solidcraft_engine::{Sel, doc::ParamUser};
+    if ["occurrences", "components", "canvases", "joints"].iter().any(|k| params.get(*k).and_then(Value::as_array).is_some_and(|a| !a.is_empty())) {
+        return None;
+    }
+    let items = params.get("items").and_then(Value::as_array).filter(|a| !a.is_empty())?;
+    let sketch = app.session.active_sketch.and_then(|sid| app.session.doc.sketch(sid).ok())?;
+    items
+        .iter()
+        .map(|item| {
+            let Ok(Sel::SketchConstraint { id }) = serde_json::from_value::<Sel>(item.clone()) else { return None };
+            let c = sketch.constraints.iter().find(|c| c.id == id)?;
+            let unused = c.param.as_deref().is_none_or(|name| {
+                app.session.doc.param_users(name).iter().all(|u| matches!(u, ParamUser::Dimension { constraint, .. } if *constraint == id))
+            });
+            unused.then_some(id)
+        })
+        .collect()
 }
 
 /// [`request`] once its dry run's report is in.
